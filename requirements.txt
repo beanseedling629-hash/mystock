@@ -1,0 +1,6 @@
+flask
+flask-cors
+akshare
+pandas
+pandas_ta
+gunicorn
