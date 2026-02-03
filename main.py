@@ -1,7 +1,6 @@
-import time
 import logging
-from datetime import datetime, timedelta
-from flask import Flask, jsonify
+from datetime import datetime
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import akshare as ak
 import pandas as pd
@@ -11,61 +10,43 @@ import pandas_ta as ta
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
-CORS(app)  # 允许跨域，方便前端调用
+CORS(app)
 
-# 配置参数
-SYMBOL_CODE = "02556"  # 迈富时
-HISTORY_START_DATE = "20240101" # 历史数据回溯起点
-
-def get_realtime_factor():
+def analyze_stock(symbol):
     try:
-        logging.info(f"开始获取 {SYMBOL_CODE} 数据...")
-
-        # ---------------------------------------------------
-        # 1. 获取实时快照 (Spot) - 这是最关键的一步
-        # ---------------------------------------------------
-        # stock_hk_spot_em 是东财接口，包含当天的【成交额】和【成交量】，这对计算 VWAP 至关重要
+        # 1. 获取实时快照 (Spot)
         spot_df = ak.stock_hk_spot_em()
-        target_row = spot_df[spot_df['代码'] == SYMBOL_CODE]
+        target_row = spot_df[spot_df['代码'] == symbol]
 
         if target_row.empty:
-            raise Exception("实时接口未找到该股票数据，可能是休市或接口调整。")
+            return None, "未找到该股票或代码错误 (请使用5位代码如 02556)"
 
         # 提取核心实时数据
         latest_price = float(target_row.iloc[0]['最新价'])
-        latest_amount = float(target_row.iloc[0]['成交额']) # 累计成交额
-        latest_volume = float(target_row.iloc[0]['成交量']) # 累计成交量
+        latest_amount = float(target_row.iloc[0]['成交额'])
+        latest_volume = float(target_row.iloc[0]['成交量'])
         latest_chg_pct = float(target_row.iloc[0]['涨跌幅'])
+        # 换手率反映活跃度
+        turnover_rate = float(target_row.iloc[0]['换手率']) if '换手率' in target_row.columns else 0
         
-        # ---------------------------------------------------
-        # 2. 计算日内 VWAP (黄线均价) 及 乖离率
-        # ---------------------------------------------------
-        # VWAP = 总成交额 / 总成交量
+        # 2. 计算日内 VWAP (均价)
         if latest_volume > 0:
             vwap_price = latest_amount / latest_volume
         else:
-            vwap_price = latest_price # 开盘瞬间防除零
+            vwap_price = latest_price
             
-        # 乖离率 = (现价 - 均价) / 均价
-        # 如果结果是 -2.5，说明现价低于均价 2.5%，属于深水区
         vwap_bias = ((latest_price - vwap_price) / vwap_price) * 100
 
-        # ---------------------------------------------------
-        # 3. 获取历史数据并拼接 (为了算 RSI, 布林带)
-        # ---------------------------------------------------
-        df_hist = ak.stock_hk_hist(symbol=SYMBOL_CODE, start_date=HISTORY_START_DATE, adjust="qfq")
-        
-        # 数据清洗：统一日期格式
+        # 3. 获取历史数据 (用于计算趋势)
+        # 必须获取足够长的数据来计算 MA60 和 MACD
+        df_hist = ak.stock_hk_hist(symbol=symbol, start_date="20240101", adjust="qfq")
         df_hist['日期'] = pd.to_datetime(df_hist['日期']).dt.date
+        
+        # 剔除可能的今日重复数据，并拼接今日实时数据
         today = datetime.now().date()
-
-        # 如果历史数据里包含了"今天"（收盘后可能出现），先剔除，确保我们用的是最新的 Spot 数据
-        if df_hist.iloc[-1]['日期'] == today:
+        if not df_hist.empty and df_hist.iloc[-1]['日期'] == today:
             df_hist = df_hist.iloc[:-1]
 
-        # 构造今日的临时 DataFrame 行
-        # 注意：pandas_ta 计算需要 Open/High/Low/Close，这里我们暂时用现价填充
-        # 虽然 High/Low 不精准，但不影响 RSI 这种基于 Close 的指标计算
         new_row = pd.DataFrame([{
             '日期': today,
             '收盘': latest_price,
@@ -74,93 +55,122 @@ def get_realtime_factor():
             '最低': latest_price,
             '成交量': latest_volume
         }])
-
-        # 拼接到末尾
         df_final = pd.concat([df_hist, new_row], ignore_index=True)
 
-        # ---------------------------------------------------
-        # 4. 计算技术指标 (Pandas TA)
-        # ---------------------------------------------------
-        # RSI
+        # 4. 计算复杂指标
+        # --- RSI ---
         df_final['RSI_6'] = ta.rsi(df_final['收盘'], length=6)
         
-        # 布林带 (用于看是否跌破下轨)
-        bbands = ta.bbands(df_final['收盘'], length=20, std=2)
-        # BBP (Bollinger Band Percentage) < 0 表示跌破下轨
-        df_final['BB_PctB'] = bbands['BBP_20_2.0'] 
+        # --- 均线趋势 (MA) ---
+        df_final['MA_5'] = ta.sma(df_final['收盘'], length=5)
+        df_final['MA_10'] = ta.sma(df_final['收盘'], length=10)
+        df_final['MA_20'] = ta.sma(df_final['收盘'], length=20)
+        df_final['MA_60'] = ta.sma(df_final['收盘'], length=60)
 
-        # ---------------------------------------------------
-        # 5. 生成信号与评分
-        # ---------------------------------------------------
-        current_rsi = df_final.iloc[-1]['RSI_6']
-        current_bb = df_final.iloc[-1]['BB_PctB']
+        # --- MACD (动量) ---
+        macd = ta.macd(df_final['收盘'])
+        df_final['MACD'] = macd['MACD_12_26_9']
+        df_final['MACD_SIGNAL'] = macd['MACDs_12_26_9']
+        df_final['MACD_HIST'] = macd['MACDh_12_26_9']
+
+        # 获取最新一帧数据
+        latest = df_final.iloc[-1]
         
-        score = 0
-        signals = []
-
-        # 信号 A: 日内分时急跌 (你截图里的那个坑)
-        # 阈值：现价低于均价 2%
-        if vwap_bias < -2.0:
-            score += 3
-            signals.append(f"分时超跌{abs(vwap_bias):.1f}%")
+        # 5. 深度逻辑分析 (AI Analyst)
+        trend_status = ""
+        momentum_status = ""
+        advice = ""
+        risk_level = "中"
         
-        # 信号 B: RSI 超卖
-        if current_rsi < 20:
-            score += 2
-            signals.append(f"RSI低位({current_rsi:.1f})")
-            
-        # 信号 C: 跌破布林下轨 (恐慌盘)
-        if current_bb < 0:
-            score += 1
-            signals.append("破布林下轨")
-
-        # 汇总文案
-        if score >= 4:
-            signal_text = "🔥 极佳买点 (共振)"
-            signal_color = "red"
-        elif score >= 2:
-            signal_text = "⚠️ 关注反弹"
-            signal_color = "#d93025"
+        # A. 趋势判断
+        if latest['MA_5'] < latest['MA_10'] < latest['MA_20']:
+            trend_status = "📉 空头排列 (主跌浪)"
+            downward_pressure = "极高"
+        elif latest['MA_5'] > latest['MA_10'] > latest['MA_20']:
+            trend_status = "📈 多头排列 (上升趋势)"
+            downward_pressure = "低"
         else:
-            signal_text = "观望 / 盘整"
-            signal_color = "#5f6368"
+            trend_status = "〰️ 震荡整理"
+            downward_pressure = "中"
 
-        # ---------------------------------------------------
-        # 6. 返回结果
-        # ---------------------------------------------------
-        return jsonify({
-            "status": "success",
-            "update_time": datetime.now().strftime("%H:%M:%S"),
-            "data": {
-                "symbol": "迈富时 (02556.HK)",
-                "price": latest_price,
-                "change_pct": round(latest_chg_pct, 2),
-                "vwap": {
-                    "price": round(vwap_price, 3),
-                    "bias": round(vwap_bias, 2), # 重点关注这个
-                    "bias_desc": "低于均价" if vwap_bias < 0 else "高于均价"
-                },
-                "indicators": {
-                    "rsi_6": round(current_rsi, 2),
-                    "bb_pct": round(current_bb, 2)
-                },
-                "strategy": {
-                    "score": score,
-                    "text": signal_text,
-                    "color": signal_color,
-                    "reasons": " + ".join(signals) if signals else "无明显信号"
-                }
+        # B. 动量/利空判断
+        if latest['MACD_HIST'] < 0 and latest['MACD'] < latest['MACD_SIGNAL']:
+            momentum_status = "🟢 空头动能增强 (加速下跌)"
+        elif latest['MACD_HIST'] > 0 and latest['MACD_HIST'] < df_final.iloc[-2]['MACD_HIST']:
+            momentum_status = "⚠️ 多头动能衰减 (上涨乏力)"
+        elif latest['MACD_HIST'] > 0:
+            momentum_status = "🔴 多头占优"
+        else:
+            momentum_status = "⚪ 动能不明"
+
+        # C. 综合买入建议
+        score = 0
+        reasons = []
+
+        # 狙击逻辑
+        if vwap_bias < -2.5:
+            score += 3
+            reasons.append("分时极度超跌(黄金坑)")
+        if latest['RSI_6'] < 20:
+            score += 2
+            reasons.append("RSI严重超卖")
+        if trend_status.startswith("📉"):
+            score -= 2 # 逆势接飞刀风险大
+            risk_level = "高 (逆势)"
+        
+        if score >= 3:
+            advice = "⚡️ 激进买入 (博反弹)"
+        elif score >= 1:
+            advice = "👀 密切观察"
+        else:
+            advice = "🛑 观望/规避"
+
+        # D. 估算抛压 (利用换手率和跌幅)
+        # 既然拿不到沽空数据，我们用“量价背离”来描述抛压
+        selling_pressure = "正常"
+        if latest_chg_pct < -3 and turnover_rate > 1:
+            selling_pressure = "🔥 恐慌性抛售 (放量大跌)"
+        elif latest_chg_pct < 0 and latest_volume < df_final.iloc[-2]['成交量']:
+            selling_pressure = "阴跌 (无量下跌)"
+
+        result = {
+            "symbol": symbol,
+            "price": latest_price,
+            "change_pct": round(latest_chg_pct, 2),
+            "vwap_bias": round(vwap_bias, 2),
+            "indicators": {
+                "rsi": round(latest['RSI_6'], 2),
+                "ma20": round(latest['MA_20'], 3),
+                "macd_bar": round(latest['MACD_HIST'], 4)
+            },
+            "analysis": {
+                "trend": trend_status,
+                "momentum": momentum_status,
+                "pressure": selling_pressure,
+                "downside_risk": downward_pressure
+            },
+            "strategy": {
+                "advice": advice,
+                "risk": risk_level,
+                "reasons": " + ".join(reasons) if reasons else "无特殊信号"
             }
-        })
+        }
+        return result, None
 
     except Exception as e:
         logging.error(f"Error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return None, str(e)
 
-@app.route('/')
-def index():
-    return "Maifushi Monitor is Running."
+@app.route('/api/analyze')
+def api_analyze():
+    # 从 URL 参数获取 code，默认迈富时
+    code = request.args.get('code', '02556')
+    data, error = analyze_stock(code)
+    
+    if error:
+        return jsonify({"status": "error", "message": error}), 500
+    
+    return jsonify({"status": "success", "data": data})
 
 if __name__ == '__main__':
-    # 监听 0.0.0.0 才能被外部访问
     app.run(host='0.0.0.0', port=8080)
